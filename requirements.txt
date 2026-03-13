@@ -1,0 +1,7 @@
+# Nexus Trader — Dependencies
+ccxt>=4.0.0
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+websockets>=12.0
+python-dotenv>=1.0.0
+aiosqlite>=0.20.0

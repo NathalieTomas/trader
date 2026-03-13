@@ -1,0 +1,76 @@
+# ══════════════════════════════════════════════════════════════
+# NEXUS TRADER — Docker Compose
+# Isole le bot avec des limites de ressources strictes
+# ══════════════════════════════════════════════════════════════
+
+services:
+  nexus-trader:
+    build: .
+    container_name: nexus-trader
+    restart: unless-stopped
+
+    # ── Variables d'environnement ──
+    env_file:
+      - .env
+
+    # ── Ports ──
+    ports:
+      - "8080:8080"       # API + WebSocket
+
+    # ── Limites de ressources (CRITIQUE pour ne pas tuer ton VPS) ──
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"         # Max 1 cœur CPU
+          memory: 512M        # Max 512 Mo de RAM
+        reservations:
+          cpus: "0.25"        # Réserve 0.25 cœur minimum
+          memory: 128M        # Réserve 128 Mo minimum
+
+    # ── Pour les VPS sans Docker Swarm, utilise les options legacy ──
+    mem_limit: 512m
+    mem_reservation: 128m
+    cpus: 1.0
+
+    # ── Volumes persistants ──
+    volumes:
+      - nexus-data:/app/data          # Base de données SQLite
+      - nexus-logs:/app/logs          # Logs
+      - nexus-cache:/app/.backtest_cache  # Cache backtest
+
+    # ── Logging (ne pas exploser le disque) ──
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"       # Max 10 Mo par fichier de log
+        max-file: "3"         # Max 3 fichiers (rotation)
+
+    # ── Sécurité ──
+    security_opt:
+      - no-new-privileges:true
+    read_only: false
+    tmpfs:
+      - /tmp:size=50M
+
+    # ── Réseau isolé ──
+    networks:
+      - nexus-net
+
+    # ── Health check ──
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+# ── Volumes nommés (persistent entre les redémarrages) ──
+volumes:
+  nexus-data:
+  nexus-logs:
+  nexus-cache:
+
+# ── Réseau isolé ──
+networks:
+  nexus-net:
+    driver: bridge
