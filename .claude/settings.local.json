@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wc -l /c/Users/conta/Desktop/Workspace/Trader/*.py)",
+      "Bash(python -c \"import py_compile; py_compile.compile\\('bot.py', doraise=True\\); print\\('OK'\\)\")",
+      "Bash(where python3:*)",
+      "Bash(cd C:/Users/conta/Desktop/Workspace/Trader && python3 -c \"import py_compile; py_compile.compile\\('bot.py', doraise=True\\); print\\('Syntax OK'\\)\")",
+      "Bash(node -e \"\nconst fs = require\\('fs'\\);\n['bot.py', 'newstrading.py'].forEach\\(f => {\n  const content = fs.readFileSync\\('C:/Users/conta/Desktop/Workspace/Trader/' + f, 'utf8'\\);\n  // Basic Python syntax checks\n  const lines = content.split\\('\\\\n'\\);\n  let indent_errors = 0;\n  let parens = 0, brackets = 0, braces = 0;\n  lines.forEach\\(\\(line, i\\) => {\n    for \\(const c of line\\) {\n      if \\(c === '\\('\\) parens++;\n      if \\(c === '\\)'\\) parens--;\n      if \\(c === '['\\) brackets++;\n      if \\(c === ']'\\) brackets--;\n      if \\(c === '{'\\) braces++;\n      if \\(c === '}'\\) braces--;\n    }\n  }\\);\n  const issues = [];\n  if \\(parens !== 0\\) issues.push\\('unmatched parens: ' + parens\\);\n  if \\(brackets !== 0\\) issues.push\\('unmatched brackets: ' + brackets\\);\n  if \\(braces !== 0\\) issues.push\\('unmatched braces: ' + braces\\);\n  console.log\\(f + ': ' + \\(issues.length ? issues.join\\(', '\\) : 'OK'\\) + ' \\(' + lines.length + ' lines\\)'\\);\n}\\);\n\")",
+      "Bash(node -e \"\nconst fs = require\\('fs'\\);\n['bot.py', 'newstrading.py'].forEach\\(f => {\n  const content = fs.readFileSync\\('C:/Users/conta/Desktop/Workspace/Trader/' + f, 'utf8'\\);\n  const lines = content.split\\('\\\\n'\\);\n  let parens = 0, brackets = 0, braces = 0;\n  lines.forEach\\(\\(line, i\\) => {\n    const stripped = line.split\\('#'\\)[0]; // ignore comments\n    for \\(const c of stripped\\) {\n      if \\(c === '\\('\\) parens++;\n      if \\(c === '\\)'\\) parens--;\n      if \\(c === '['\\) brackets++;\n      if \\(c === ']'\\) brackets--;\n      if \\(c === '{'\\) braces++;\n      if \\(c === '}'\\) braces--;\n    }\n  }\\);\n  const issues = [];\n  if \\(parens !== 0\\) issues.push\\('unmatched parens: ' + parens\\);\n  if \\(brackets !== 0\\) issues.push\\('unmatched brackets: ' + brackets\\);\n  if \\(braces !== 0\\) issues.push\\('unmatched braces: ' + braces\\);\n  console.log\\(f + ': ' + \\(issues.length ? issues.join\\(', '\\) : 'OK'\\) + ' \\(' + lines.length + ' lines\\)'\\);\n}\\);\n\")"
+    ]
+  }
+}

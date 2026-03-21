@@ -59,6 +59,13 @@ try:
 except ImportError:
     pass  # .env optionnel
 
+# News Trading (MEV-style macro events)
+try:
+    from newstrading import NewsTradingEngine
+    HAS_NEWS_TRADING = True
+except ImportError:
+    HAS_NEWS_TRADING = False
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Configuration
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -89,6 +96,10 @@ class BotConfig:
     max_open_positions: int = 3
     min_confidence: float = 0.4
     max_daily_loss_pct: float = 5.0   # perte max journalière → arrêt
+
+    # Frais & Slippage
+    trading_fee_pct: float = 0.1      # Frais Binance par trade (0.1% maker/taker)
+    slippage_pct: float = 0.05        # Slippage estimé sur market orders
     
     # Indicator params
     rsi_period: int = 14
@@ -140,10 +151,11 @@ class TradeDB:
                 price REAL NOT NULL,
                 amount REAL NOT NULL,
                 cost REAL NOT NULL,
+                fee REAL DEFAULT 0,          -- Frais de la transaction
                 strategy TEXT,
                 reason TEXT,
                 confidence REAL,
-                pnl REAL DEFAULT 0,
+                pnl REAL DEFAULT 0,          -- P&L NET (après frais)
                 mode TEXT NOT NULL           -- paper, live
             );
             
@@ -507,30 +519,48 @@ class ExchangeManager:
         base, quote = pair.split("/")
         
         if self.config.trading_mode == TradingMode.PAPER:
-            # Simulation
-            cost = amount * price
-            
+            # Simulation avec frais et slippage
+            fee_rate = self.config.trading_fee_pct / 100
+            slip_rate = self.config.slippage_pct / 100
+
             if side == "buy":
-                if self._paper_balance.get(quote, 0) < cost:
-                    log.warning(f"⚠️ Balance insuffisante: {self._paper_balance.get(quote, 0):.2f} {quote} < {cost:.2f}")
+                # Slippage: prix d'exécution légèrement plus haut
+                exec_price = price * (1 + slip_rate)
+                cost = amount * exec_price
+                fee = cost * fee_rate
+                total_cost = cost + fee
+
+                if self._paper_balance.get(quote, 0) < total_cost:
+                    log.warning(f"⚠️ Balance insuffisante: {self._paper_balance.get(quote, 0):.2f} {quote} < {total_cost:.2f} (incl. frais)")
                     return None
-                self._paper_balance[quote] = self._paper_balance.get(quote, 0) - cost
+                self._paper_balance[quote] = self._paper_balance.get(quote, 0) - total_cost
                 self._paper_balance[base] = self._paper_balance.get(base, 0) + amount
-            
+
             elif side == "sell":
+                # Slippage: prix d'exécution légèrement plus bas
+                exec_price = price * (1 - slip_rate)
+                cost = amount * exec_price
+                fee = cost * fee_rate
+                net_revenue = cost - fee
+
                 if self._paper_balance.get(base, 0) < amount:
                     log.warning(f"⚠️ Balance insuffisante: {self._paper_balance.get(base, 0):.6f} {base}")
                     return None
                 self._paper_balance[base] = self._paper_balance.get(base, 0) - amount
-                self._paper_balance[quote] = self._paper_balance.get(quote, 0) + cost
-            
-            log.info(f"📝 [PAPER] {side.upper()} {amount:.6f} {base} @ ${price:.2f} (coût: ${cost:.2f})")
+                self._paper_balance[quote] = self._paper_balance.get(quote, 0) + net_revenue
+            else:
+                exec_price = price
+                cost = amount * price
+                fee = cost * fee_rate
+
+            log.info(f"📝 [PAPER] {side.upper()} {amount:.6f} {base} @ ${exec_price:.2f} (frais: ${fee:.2f}, slip: {slip_rate*100:.2f}%)")
             return {
                 "id": f"paper_{int(time.time()*1000)}",
                 "side": side,
                 "amount": amount,
-                "price": price,
+                "price": exec_price,
                 "cost": cost,
+                "fee": round(fee, 4),
                 "status": "filled",
             }
         
@@ -562,6 +592,7 @@ class Position:
     take_profit: float
     entry_time: str
     strategy: str
+    entry_fee: float = 0.0            # Frais payés à l'entrée
 
 
 class TradingBot:
@@ -579,14 +610,26 @@ class TradingBot:
             "win_trades": 0,
             "total_pnl": 0.0,
             "daily_pnl": 0.0,
+            "total_fees": 0.0,
+            "total_pnl_gross": 0.0,     # P&L avant frais (pour comparaison)
         }
         self._ws_clients: list[WebSocket] = []
+
+        # News Trading Engine
+        self.news_engine = None
+        if HAS_NEWS_TRADING:
+            self.news_engine = NewsTradingEngine()
+            log.info("News Trading module loaded")
     
     async def start(self):
         """Démarre le bot."""
         await self.exchange.connect()
         self.is_running = True
-        
+
+        # Initialise le news trading
+        if self.news_engine:
+            await self.news_engine.initialize()
+
         # Charge l'historique
         self.candles = await self.exchange.fetch_candles(self.config.candle_limit)
         log.info(f"📊 {len(self.candles)} bougies chargées ({self.config.pair} / {self.config.timeframe})")
@@ -639,7 +682,21 @@ class TradingBot:
             return
         
         signal = strategy.evaluate(self.candles, self.config)
-        
+
+        # News Trading: vérifie si un événement macro override le signal technique
+        if self.news_engine:
+            news_signal = await self.news_engine.check_and_signal(price, self.candles, self.exchange.exchange)
+            if news_signal and news_signal.action != "HOLD":
+                # Le signal news override le technique si plus confiant
+                if news_signal.confidence > signal.confidence:
+                    log.info(f"NEWS OVERRIDE: {news_signal.event_name} -> {news_signal.action} "
+                             f"(news: {news_signal.confidence:.0%} > tech: {signal.confidence:.0%})")
+                    signal = Signal(
+                        action=news_signal.action,
+                        confidence=news_signal.confidence,
+                        reason=f"[NEWS] {news_signal.reason}",
+                    )
+
         # Exécute si signal suffisamment confiant
         if signal.action == "BUY" and signal.confidence >= self.config.min_confidence:
             await self._execute_buy(price, signal, strategy.name)
@@ -651,127 +708,163 @@ class TradingBot:
         if len(self.positions) >= self.config.max_open_positions:
             log.debug("Max positions atteint, skip BUY")
             return
-        
+
         balance = await self.exchange.get_balance()
         available = balance.get(self.config.base_currency, 0)
-        
+
         if available < 10:  # minimum $10
             return
-        
-        # Calcule la taille de la position
+
+        # Vérifie que le take-profit couvre les frais aller-retour
+        roundtrip_cost_pct = (self.config.trading_fee_pct + self.config.slippage_pct) * 2
+        if self.config.take_profit_pct <= roundtrip_cost_pct:
+            log.warning(f"⚠️ TP ({self.config.take_profit_pct}%) <= frais aller-retour ({roundtrip_cost_pct:.2f}%), trade non rentable")
+            return
+
+        # Calcule la taille de la position (en tenant compte des frais)
+        fee_rate = self.config.trading_fee_pct / 100
+        slip_rate = self.config.slippage_pct / 100
         allocation = available * self.config.position_size_pct / 100
-        amount = allocation / price
-        
+        exec_price = price * (1 + slip_rate)
+        amount = (allocation * (1 - fee_rate)) / exec_price
+        entry_fee = allocation * fee_rate
+
         # Place l'ordre
         order = await self.exchange.place_order("buy", amount, price)
         if not order:
             return
-        
-        # Enregistre la position
-        stop_loss = price * (1 - self.config.stop_loss_pct / 100)
-        take_profit = price * (1 + self.config.take_profit_pct / 100)
-        
+
+        actual_price = order.get("price", exec_price)
+        actual_fee = order.get("fee", entry_fee)
+
+        # Enregistre la position avec le prix réel (incl. slippage)
+        stop_loss = actual_price * (1 - self.config.stop_loss_pct / 100)
+        take_profit = actual_price * (1 + self.config.take_profit_pct / 100)
+
         position = Position(
-            entry_price=price,
+            entry_price=actual_price,
             amount=amount,
             side="long",
             stop_loss=round(stop_loss, 2),
             take_profit=round(take_profit, 2),
             entry_time=datetime.now(timezone.utc).isoformat(),
             strategy=strategy_name,
+            entry_fee=round(actual_fee, 4),
         )
         self.positions.append(position)
-        
+
+        # Track fees
+        self.stats["total_fees"] += actual_fee
+
         # Log en DB
         self.db.log_trade({
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "pair": self.config.pair,
             "side": "BUY",
-            "price": price,
+            "price": round(actual_price, 2),
             "amount": round(amount, 6),
-            "cost": round(amount * price, 2),
+            "cost": round(amount * actual_price, 2),
             "strategy": strategy_name,
             "reason": signal.reason,
             "confidence": round(signal.confidence, 3),
-            "pnl": 0,
+            "pnl": round(-actual_fee, 4),  # Les frais d'entrée sont un coût immédiat
             "mode": self.config.trading_mode.value,
         })
-        
+
         self.stats["total_trades"] += 1
-        log.info(f"🟢 ACHAT {amount:.6f} BTC @ ${price:.2f} — SL: ${stop_loss:.2f} / TP: ${take_profit:.2f} — {signal.reason}")
+        log.info(f"🟢 ACHAT {amount:.6f} BTC @ ${actual_price:.2f} (frais: ${actual_fee:.2f}) — SL: ${stop_loss:.2f} / TP: ${take_profit:.2f} — {signal.reason}")
     
     async def _execute_sell(self, price: float, signal: Signal, strategy_name: str):
         """Vend toutes les positions ouvertes."""
         if not self.positions:
             return
-        
+
         for pos in self.positions[:]:
-            pnl = (price - pos.entry_price) * pos.amount
-            
             order = await self.exchange.place_order("sell", pos.amount, price)
             if not order:
                 continue
-            
+
+            actual_price = order.get("price", price)
+            exit_fee = order.get("fee", pos.amount * actual_price * self.config.trading_fee_pct / 100)
+
+            # P&L brut (sans frais)
+            pnl_gross = (actual_price - pos.entry_price) * pos.amount
+            # P&L net (frais d'entrée + frais de sortie)
+            total_fees = pos.entry_fee + exit_fee
+            pnl_net = pnl_gross - total_fees
+
+            self.stats["total_fees"] += exit_fee
+
             self.db.log_trade({
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "pair": self.config.pair,
                 "side": "SELL",
-                "price": price,
+                "price": round(actual_price, 2),
                 "amount": round(pos.amount, 6),
-                "cost": round(pos.amount * price, 2),
+                "cost": round(pos.amount * actual_price, 2),
                 "strategy": strategy_name,
-                "reason": signal.reason,
+                "reason": f"{signal.reason} | frais: ${total_fees:.2f}",
                 "confidence": round(signal.confidence, 3),
-                "pnl": round(pnl, 2),
+                "pnl": round(pnl_net, 2),
                 "mode": self.config.trading_mode.value,
             })
-            
+
             self.stats["total_trades"] += 1
-            self.stats["total_pnl"] += pnl
-            if pnl > 0:
+            self.stats["total_pnl"] += pnl_net
+            self.stats["total_pnl_gross"] += pnl_gross
+            if pnl_net > 0:
                 self.stats["win_trades"] += 1
-            
+
             self.positions.remove(pos)
-            log.info(f"🔴 VENTE {pos.amount:.6f} BTC @ ${price:.2f} — P&L: ${pnl:.2f} — {signal.reason}")
+            log.info(f"🔴 VENTE {pos.amount:.6f} BTC @ ${actual_price:.2f} — P&L brut: ${pnl_gross:.2f} / net: ${pnl_net:.2f} (frais: ${total_fees:.2f}) — {signal.reason}")
     
     async def _check_exit_conditions(self, price: float):
         """Vérifie stop-loss et take-profit."""
         for pos in self.positions[:]:
-            pnl = (price - pos.entry_price) * pos.amount
-            
             triggered = None
             if price <= pos.stop_loss:
                 triggered = "STOP_LOSS"
             elif price >= pos.take_profit:
                 triggered = "TAKE_PROFIT"
-            
+
             if triggered:
                 order = await self.exchange.place_order("sell", pos.amount, price)
                 if not order:
                     continue
-                
+
+                actual_price = order.get("price", price)
+                exit_fee = order.get("fee", pos.amount * actual_price * self.config.trading_fee_pct / 100)
+
+                # P&L brut et net
+                pnl_gross = (actual_price - pos.entry_price) * pos.amount
+                total_fees = pos.entry_fee + exit_fee
+                pnl_net = pnl_gross - total_fees
+
+                self.stats["total_fees"] += exit_fee
+
                 self.db.log_trade({
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "pair": self.config.pair,
                     "side": triggered,
-                    "price": price,
+                    "price": round(actual_price, 2),
                     "amount": round(pos.amount, 6),
-                    "cost": round(pos.amount * price, 2),
+                    "cost": round(pos.amount * actual_price, 2),
                     "strategy": pos.strategy,
-                    "reason": f"{triggered} @ ${price:.2f}",
+                    "reason": f"{triggered} @ ${actual_price:.2f} | frais: ${total_fees:.2f}",
                     "confidence": 1.0,
-                    "pnl": round(pnl, 2),
+                    "pnl": round(pnl_net, 2),
                     "mode": self.config.trading_mode.value,
                 })
-                
+
                 self.stats["total_trades"] += 1
-                self.stats["total_pnl"] += pnl
-                if pnl > 0:
+                self.stats["total_pnl"] += pnl_net
+                self.stats["total_pnl_gross"] += pnl_gross
+                if pnl_net > 0:
                     self.stats["win_trades"] += 1
-                
+
                 self.positions.remove(pos)
                 emoji = "🎯" if triggered == "TAKE_PROFIT" else "⛔"
-                log.info(f"{emoji} {triggered} — {pos.amount:.6f} BTC @ ${price:.2f} — P&L: ${pnl:.2f}")
+                log.info(f"{emoji} {triggered} — {pos.amount:.6f} BTC @ ${actual_price:.2f} — P&L brut: ${pnl_gross:.2f} / net: ${pnl_net:.2f} (frais: ${total_fees:.2f})")
     
     async def _broadcast_state(self):
         """Envoie l'état actuel à tous les clients WebSocket connectés."""
@@ -796,6 +889,11 @@ class TradingBot:
                 "rsi": Indicators.rsi([c["close"] for c in self.candles], self.config.rsi_period),
                 "macd": Indicators.macd([c["close"] for c in self.candles]),
                 "bollinger": Indicators.bollinger([c["close"] for c in self.candles], self.config.bb_period),
+            },
+            "news": {
+                "events": self.news_engine.get_upcoming_events_summary()[:5] if self.news_engine else [],
+                "signals": self.news_engine.get_active_signals() if self.news_engine else [],
+                "cross_assets": self.news_engine.get_cross_asset_data() if self.news_engine else {},
             },
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
@@ -839,6 +937,11 @@ async def get_status():
         "balance": balance,
         "positions": [asdict(p) for p in bot.positions],
         "stats": bot.stats,
+        "fee_config": {
+            "trading_fee_pct": config.trading_fee_pct,
+            "slippage_pct": config.slippage_pct,
+            "roundtrip_cost_pct": (config.trading_fee_pct + config.slippage_pct) * 2,
+        },
     }
 
 
@@ -864,6 +967,19 @@ async def set_strategy(name: str):
         log.info(f"🧠 Stratégie changée: {name}")
         return {"status": "ok", "strategy": name}
     return {"status": "error", "message": f"Stratégie inconnue: {name}"}
+
+
+@app.get("/api/news")
+async def get_news_events():
+    """Evenements macro a venir et signaux actifs."""
+    if not bot.news_engine:
+        return {"enabled": False, "events": [], "signals": [], "cross_assets": {}}
+    return {
+        "enabled": True,
+        "events": bot.news_engine.get_upcoming_events_summary(),
+        "signals": bot.news_engine.get_active_signals(),
+        "cross_assets": bot.news_engine.get_cross_asset_data(),
+    }
 
 
 @app.websocket("/ws")
