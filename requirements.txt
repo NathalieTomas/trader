@@ -1,7 +1,33 @@
-# Nexus Trader — Dependencies
+# ══════════════════════════════════════════════════════════════
+# Nexus Trader + GemHunter — Dependencies
+# ══════════════════════════════════════════════════════════════
+
+# ── Core Bot ──
 ccxt>=4.0.0
 fastapi>=0.110.0
 uvicorn[standard]>=0.27.0
 websockets>=12.0
 python-dotenv>=1.0.0
 aiosqlite>=0.20.0
+
+# ── GemHunter Pool Listener ──
+aiohttp>=3.9.0
+web3>=6.15.0
+eth-abi>=5.0.0
+
+# ── Solana ──
+base58>=2.1.0
+solders>=0.21.0
+
+# ── Swap Executor (chiffrement clés) ──
+cryptography>=42.0.0
+
+# ── Intelligence / Sentiment ──
+anthropic>=0.25.0
+feedparser>=6.0.0
+
+# ── Auth ──
+pyjwt[crypto]>=2.8.0
+pyotp>=2.9.0
+passlib[bcrypt]>=1.7.0
+python-multipart>=0.0.9
