@@ -30,6 +30,11 @@ CONFIGURATION .env:
     MIN_SCORE=50
     MAX_TOKEN_AGE_BLOCKS=10
 """
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 import asyncio
 import json
@@ -182,7 +187,7 @@ class EVMPoolListener:
         
         # Toutes les factory addresses de cette chain
         self._factory_addresses = [
-            addr.lower() for addr in FACTORIES.get(chain, {}).values()
+            addr for addr in FACTORIES.get(chain, {}).values()
         ]
         self._factory_names = {
             addr.lower(): name 
@@ -220,7 +225,7 @@ class EVMPoolListener:
     async def _listen(self):
         """Connexion websocket et écoute des events."""
         import websockets
-        
+        print(f"DEBUG connecting to: {self.ws_rpc}") 
         async with websockets.connect(self.ws_rpc, ping_interval=20) as ws:
             self._ws = ws
             self._reconnect_delay = 1  # Reset on success

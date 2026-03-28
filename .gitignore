@@ -28,6 +28,9 @@ data/
 logs/
 *.log
 
+*.db-shm
+*.db-wal
+
 # ── Cache ──
 .backtest_cache/
 .cache/
