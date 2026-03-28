@@ -44,6 +44,7 @@ from pool_listener import (
 )
 from swap_executor import SwapRouter, SwapRequest, SwapChain, SwapResult
 from user_db import UserDB
+from score_enricher import ScoreEnricher
 
 try:
     from fastapi import FastAPI
@@ -696,6 +697,7 @@ class GemHunterApp:
         self.db = UserDB()
         self.swap_router = SwapRouter()
         self.analyzer = TokenAnalyzer()
+        self.enricher = ScoreEnricher()
 
         # Telegram bot intégré
         self.telegram = IntegratedTelegramBot(
@@ -729,9 +731,12 @@ class GemHunterApp:
             f"— Token: {pool.target_token[:16]}..."
         )
 
-        # Analyse
+        # Analyse de base (honeypot, taxes, liquidité)
         pool = await self.analyzer.analyze(pool)
         self.stats["pools_analyzed"] += 1
+
+        # Enrichissement (trending, smart money, market context)
+        pool = await self.enricher.enrich(pool)
 
         analysis_time = time.time() - detect_time
 
@@ -870,6 +875,7 @@ class GemHunterApp:
         for listener in self.listeners:
             await listener.stop()
         await self.analyzer.close()
+        await self.enricher.close()
         await self.telegram.stop()
         await self.swap_router.close()
         self.db.close()

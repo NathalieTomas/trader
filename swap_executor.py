@@ -37,6 +37,12 @@ CONFIGURATION .env:
     ENCRYPTION_KEY=...    # Généré automatiquement au premier lancement
 """
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 import asyncio
 import hashlib
 import json
@@ -67,6 +73,12 @@ try:
     HAS_CRYPTO = True
 except ImportError:
     HAS_CRYPTO = False
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 log = logging.getLogger("nexus.swap_executor")
 

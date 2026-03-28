@@ -30,11 +30,6 @@ CONFIGURATION .env:
     MIN_SCORE=50
     MAX_TOKEN_AGE_BLOCKS=10
 """
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
 
 import asyncio
 import json
@@ -187,7 +182,7 @@ class EVMPoolListener:
         
         # Toutes les factory addresses de cette chain
         self._factory_addresses = [
-            addr for addr in FACTORIES.get(chain, {}).values()
+            addr.lower() for addr in FACTORIES.get(chain, {}).values()
         ]
         self._factory_names = {
             addr.lower(): name 
@@ -196,8 +191,12 @@ class EVMPoolListener:
 
     async def _get_session(self):
         if not self._session or self._session.closed:
+            import ssl
+            ssl_ctx = ssl.create_default_context()
+            conn = aiohttp.TCPConnector(ssl=ssl_ctx)
             self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=15)
+                timeout=aiohttp.ClientTimeout(total=15),
+                connector=conn,
             )
         return self._session
 
@@ -225,7 +224,7 @@ class EVMPoolListener:
     async def _listen(self):
         """Connexion websocket et écoute des events."""
         import websockets
-        print(f"DEBUG connecting to: {self.ws_rpc}") 
+        
         async with websockets.connect(self.ws_rpc, ping_interval=20) as ws:
             self._ws = ws
             self._reconnect_delay = 1  # Reset on success
@@ -331,15 +330,39 @@ class EVMPoolListener:
             timestamp=time.time(),
         )
         
+        # Récupère le nom du token via DexScreener
+        symbol = await self._fetch_evm_token_name(target_token)
+        if symbol != "?":
+            pool.target_symbol = symbol
+            if target_token == token0:
+                pool.token0_symbol = symbol
+            else:
+                pool.token1_symbol = symbol
+        
         log.info(
             f"🆕 [{self.chain.value}] Nouveau pool détecté! "
-            f"{dex_name} — {token0[:10]}.../{token1[:10]}... "
+            f"{dex_name} — {pool.target_symbol} "
             f"— Pool: {pair_address[:10]}... "
             f"— Block: {pool.block_number}"
         )
         
         # Callback pour analyse + alerte
         asyncio.create_task(self.on_new_pool(pool))
+
+    async def _fetch_evm_token_name(self, token_address: str) -> str:
+        """Récupère le symbol d'un token EVM via DexScreener."""
+        session = await self._get_session()
+        try:
+            url = f"https://api.dexscreener.com/latest/dex/tokens/{token_address}"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    pairs = data.get("pairs", [])
+                    if pairs:
+                        return pairs[0].get("baseToken", {}).get("symbol", "?")
+        except Exception:
+            pass
+        return "?"
 
     async def stop(self):
         self._running = False
@@ -460,15 +483,11 @@ class SolanaPoolListener:
         if err is not None:
             return
         
-        # Cherche les logs d'initialisation de pool
+        # Filtre STRICT: uniquement "initialize2" en case-sensitive
+        # "ray_log" et "init" matchent trop (swaps, rebalances, etc.)
         is_pool_init = False
         for log_line in logs:
-            # Raydium V4 AMM utilise "initialize2" pour créer un pool
-            if "initialize2" in log_line.lower() or "ray_log" in log_line.lower():
-                is_pool_init = True
-                break
-            # Pattern alternatif
-            if "init" in log_line.lower() and "amm" in log_line.lower():
+            if "initialize2" in log_line:
                 is_pool_init = True
                 break
         
@@ -491,6 +510,8 @@ class SolanaPoolListener:
         """
         Récupère les détails d'une transaction Raydium pour
         extraire les adresses des tokens du pool.
+        Filtre les pools avec trop peu de liquidité.
+        Récupère le nom/symbol du token.
         """
         session = await self._get_session()
         
@@ -530,34 +551,39 @@ class SolanaPoolListener:
                 else:
                     account_keys.append(str(ak))
             
-            # Chercher les token mints dans les pre/post token balances
-            token_mints = set()
-            for balance in meta.get("postTokenBalances", []):
-                mint = balance.get("mint", "")
-                if mint and mint not in SOLANA_BASE_TOKENS:
-                    token_mints.add(mint)
-            
-            # Identifie le target token (pas SOL/USDC/USDT)
+            # Chercher les token mints et estimer la liquidité
             base_mint = ""
             target_mint = ""
+            initial_base_amount = 0
             
             all_mints = set()
             for balance in meta.get("postTokenBalances", []):
                 m = balance.get("mint", "")
                 if m:
                     all_mints.add(m)
-            
-            for m in all_mints:
-                if m in SOLANA_BASE_TOKENS:
-                    base_mint = m
-                else:
-                    target_mint = m
+                    if m in SOLANA_BASE_TOKENS:
+                        base_mint = m
+                        try:
+                            amount = float(balance.get("uiTokenAmount", {}).get("uiAmount", 0) or 0)
+                            if amount > initial_base_amount:
+                                initial_base_amount = amount
+                        except (ValueError, TypeError):
+                            pass
+                    else:
+                        target_mint = m
             
             if not target_mint:
-                # Pas trouvé de nouveau token — probablement pas un nouveau listing
                 return None
             
+            # Filtre: ignore les pools avec moins de 0.5 SOL de liquidité
+            if base_mint in SOLANA_BASE_TOKENS and SOLANA_BASE_TOKENS[base_mint][0] == "SOL":
+                if initial_base_amount < 0.5:
+                    return None
+            
             base_symbol = SOLANA_BASE_TOKENS.get(base_mint, ("?", 0))[0]
+            
+            # Récupère le nom et symbol du token
+            token_name, token_symbol = await self._fetch_token_metadata(target_mint)
             
             pool = NewPool(
                 chain=Chain.SOLANA,
@@ -565,10 +591,10 @@ class SolanaPoolListener:
                 pool_address=account_keys[1] if len(account_keys) > 1 else "",
                 token0=target_mint,
                 token1=base_mint,
-                token0_symbol="?",
+                token0_symbol=token_symbol,
                 token1_symbol=base_symbol,
                 target_token=target_mint,
-                target_symbol="?",
+                target_symbol=token_symbol,
                 tx_hash=signature,
                 block_number=result.get("slot", 0),
                 timestamp=time.time(),
@@ -579,6 +605,49 @@ class SolanaPoolListener:
         except Exception as e:
             log.error(f"[solana] Failed to fetch TX details: {e}")
             return None
+
+    async def _fetch_token_metadata(self, mint: str) -> tuple[str, str]:
+        """Récupère le nom et symbol d'un token Solana via DexScreener ou Jupiter."""
+        session = await self._get_session()
+        name = "?"
+        symbol = "?"
+        
+        # Méthode 1: DexScreener (rapide, fiable)
+        try:
+            url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    pairs = data.get("pairs", [])
+                    if pairs:
+                        base = pairs[0].get("baseToken", {})
+                        s = base.get("symbol", "")
+                        n = base.get("name", "")
+                        if s:
+                            symbol = s
+                        if n:
+                            name = n
+                        if symbol != "?":
+                            return name, symbol
+        except Exception:
+            pass
+        
+        # Méthode 2: Jupiter Token List (fallback)
+        try:
+            url = f"https://tokens.jup.ag/token/{mint}"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    s = data.get("symbol", "")
+                    n = data.get("name", "")
+                    if s:
+                        symbol = s
+                    if n:
+                        name = n
+        except Exception:
+            pass
+        
+        return name, symbol
 
     async def stop(self):
         self._running = False
@@ -979,15 +1048,21 @@ class TelegramMultiUserBot:
 
     async def _poll_updates(self):
         """Long polling pour les messages entrants."""
-        session = await self._get_session()
+        import httpx
         url = f"{self.api_url}/getUpdates"
         params = {"offset": self._offset, "timeout": 30, "limit": 100}
         
-        async with session.get(url, params=params) as resp:
-            if resp.status != 200:
-                await asyncio.sleep(5)
-                return
-            data = await resp.json()
+        try:
+            async with httpx.AsyncClient(timeout=45) as client:
+                resp = await client.get(url, params=params)
+                if resp.status_code != 200:
+                    await asyncio.sleep(5)
+                    return
+                data = resp.json()
+        except Exception as e:
+            log.warning(f"📱 Telegram poll error: {e}")
+            await asyncio.sleep(5)
+            return
         
         for update in data.get("result", []):
             self._offset = update["update_id"] + 1
@@ -1268,10 +1343,11 @@ class TelegramMultiUserBot:
             payload["reply_markup"] = json.dumps(reply_markup)
         
         try:
-            async with session.post(f"{self.api_url}/sendMessage", json=payload) as resp:
-                if resp.status != 200:
-                    err = await resp.text()
-                    log.warning(f"📱 Telegram send error ({resp.status}): {err[:100]}")
+            import httpx
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.post(f"{self.api_url}/sendMessage", json=payload)
+                if resp.status_code != 200:
+                    log.warning(f"📱 Telegram send error ({resp.status_code}): {resp.text[:100]}")
         except Exception as e:
             log.warning(f"📱 Telegram error: {e}")
 
@@ -1279,10 +1355,12 @@ class TelegramMultiUserBot:
         """Répond à un callback query."""
         session = await self._get_session()
         try:
-            await session.post(
-                f"{self.api_url}/answerCallbackQuery",
-                json={"callback_query_id": callback_id, "text": text}
-            )
+            import httpx
+            async with httpx.AsyncClient(timeout=10) as client:
+                await client.post(
+                    f"{self.api_url}/answerCallbackQuery",
+                    json={"callback_query_id": callback_id, "text": text}
+                )
         except Exception:
             pass
 
